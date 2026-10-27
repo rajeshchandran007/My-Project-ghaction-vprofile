@@ -20,7 +20,7 @@ jobs:
           distribution: 'temurin'
           cache: 'maven'
 
-      # Compiles, runs tests, and executes plugins to generate the XML reports
+      # FIX: Ensure target/classes and test reports are generated before running Sonar
       - name: Build and Test with Maven
         run: mvn clean verify checkstyle:checkstyle
 
@@ -55,7 +55,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # CRITICAL FIX: Authenticate with AWS first
+      # FIX: Must explicitly configure AWS credentials before you can login to ECR
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -68,13 +68,59 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build, tag, and push image to Amazon ECR
+        id: build-image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ github.sha }} # Recommended to use commit SHA instead of 'latest'
+          IMAGE_TAG: ${{ github.run_number }}
         run: |
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          # Optional: Tag and push latest alongside it
           docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+  Deploy:
+    runs-on: ubuntu-latest
+    needs: Build_and_Publish
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Authenticate to AWS so kubectl and Helm can talk to your EKS cluster
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Authenticate kubectl to talk to your specific EKS cluster instance
+      - name: Update Kubeconfig
+        run: aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # FIX: Completed the cut-off expression to dynamically generate a valid ECR Secret inside EKS
+      - name: Login to ECR
+        run: |
+          kubectl create secret docker-registry regcred \
+            --docker-server=${{ steps.login-ecr.outputs.registry }} \
+            --docker-username=AWS \
+            --docker-password=$(aws ecr get-login-password --region ${{ env.AWS_REGION }}) \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      # FIX: Restructured values argument to cleanly inject the appimage and tag parameters into Helm
+      - name: Deploy Helm
+        uses: bitovi/github-actions-deploy-eks-helm@v1.2.8
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          cluster-name: ${{ env.EKS_CLUSTER }}
+          #config-files: .github/values/dev.yaml
+          chart-path: helm/vprofilecharts
+          namespace: default
+          values: appimage=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }},apptag=${{ github.run_number }}
+          name: vprofile-stack
